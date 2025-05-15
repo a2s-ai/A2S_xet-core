@@ -76,6 +76,10 @@ pub fn upload_files(
     let refresher = token_refresher.map(WrappedTokenRefresher::from_func).transpose()?.map(Arc::new);
     let updater = progress_updater.map(WrappedProgressUpdater::new).transpose()?.map(Arc::new);
 
+    if file_paths.len() < 2 {
+        panic!("upload_files() should be used with at least 2 files");
+    }
+
     async_run(py, async move {
         let out: Vec<PyXetUploadInfo> = data_client::upload_async(
             file_paths,
