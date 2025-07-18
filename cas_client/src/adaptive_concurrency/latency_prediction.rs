@@ -29,6 +29,9 @@ pub struct LatencyPredictor {
     last_update: Instant,
 }
 
+// Use MB for the scale of the size; this is more numerically stable.
+const BASE_SIZE_UNIT: f64 = 1_000_000.;
+
 impl LatencyPredictor {
     pub fn new(decay_half_life: Duration) -> Self {
         Self {
@@ -37,7 +40,7 @@ impl LatencyPredictor {
             mean_y: 0.0,
             s_xx: 0.0,
             s_xy: 0.0,
-            base_time_secs: 120.0, // 2 minutes, but no real weight on this.
+            base_time_secs: 0.,
             inv_throughput: 0.0,
             decay_half_life_secs: decay_half_life.as_secs_f64(),
             last_update: Instant::now(),
@@ -59,17 +62,17 @@ impl LatencyPredictor {
     /// - `size_bytes`: the size of the completed transmission.
     /// - `duration`: the time taken to complete the transmission.
     /// - `n_concurrent`: the number of concurrent connections at the time.
-    pub fn update(&mut self, size_bytes: usize, duration: Duration, avg_concurrent: f64) {
+    pub fn update(&mut self, size_bytes: u64, duration: Duration, avg_concurrent: f64) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
         let decay = (-elapsed / self.decay_half_life_secs).exp2();
 
         // Feature x: number of bytes transferred in this time, assuming that multiple similar
         // connections are active.  This is just a way to treat the
-        let x = (size_bytes as f64) * avg_concurrent.max(1.);
+        let x = (size_bytes as f64) / BASE_SIZE_UNIT;
 
         // Target y: the time it would take to transfer x bytes, i.e. secs / byte.
-        let y = duration.as_secs_f64().max(1e-6);
+        let y = duration.as_secs_f64().max(1e-6) / avg_concurrent.max(1.);
 
         // Decay previous statistics
         self.sum_w *= decay;
@@ -77,24 +80,26 @@ impl LatencyPredictor {
         self.s_xy *= decay;
 
         // Update means with numerically stable method
-        let weight = 1.0;
-        let new_sum_w = self.sum_w + weight;
+        let obs_weight = 1.0;
+        let new_sum_w = self.sum_w + obs_weight;
         let delta_x = x - self.mean_x;
         let delta_y = y - self.mean_y;
 
-        let mean_x_new = self.mean_x + (weight * delta_x) / new_sum_w;
-        let mean_y_new = self.mean_y + (weight * delta_y) / new_sum_w;
+        let mean_x_new = self.mean_x + (obs_weight * delta_x) / new_sum_w;
+        let mean_y_new = self.mean_y + (obs_weight * delta_y) / new_sum_w;
 
-        self.s_xx += weight * delta_x * (x - mean_x_new);
-        self.s_xy += weight * delta_x * (y - mean_y_new);
+        self.s_xx += obs_weight * delta_x * (x - mean_x_new);
+        self.s_xy += obs_weight * delta_x * (y - mean_y_new);
 
         self.mean_x = mean_x_new;
         self.mean_y = mean_y_new;
         self.sum_w = new_sum_w;
 
         if self.s_xx > 1e-8 {
-            let slope = self.s_xy / self.s_xx;
-            let intercept = self.mean_y - slope * self.mean_x;
+            // Negative slopes or intercept here isn't meaningful and can cause negative predicted durations,
+            // so clamp the slope to 0.
+            let slope = (self.s_xy / self.s_xx).max(0.);
+            let intercept = (self.mean_y - slope * self.mean_x).max(0.);
 
             self.base_time_secs = intercept;
             self.inv_throughput = slope;
@@ -102,6 +107,15 @@ impl LatencyPredictor {
             self.base_time_secs = self.mean_y;
             self.inv_throughput = 0.0;
         }
+
+        eprintln!(
+            "x = {x}; y = {y}; mean_x = {}, mean_y = {}, intercept = {}, slope = {}, bw = {}",
+            self.mean_x,
+            self.mean_y,
+            self.base_time_secs,
+            self.inv_throughput,
+            self.predicted_bandwidth()
+        );
 
         self.last_update = now;
     }
@@ -116,8 +130,15 @@ impl LatencyPredictor {
     /// - `size_bytes`: the size of the transfer.
     /// - `n_concurrent`: the number of concurrent connections.
     pub fn predicted_latency(&self, size_bytes: u64, avg_concurrent: f64) -> Duration {
-        let predicted_secs_without_concurrency = self.base_time_secs + size_bytes as f64 * self.inv_throughput;
-        let predicted_secs = predicted_secs_without_concurrency * avg_concurrent.max(1.);
+        // Feature x: number of bytes transferred in this time, assuming that multiple similar
+        // connections are active.  This is just a way to treat the
+        let x = (size_bytes as f64) / BASE_SIZE_UNIT;
+
+        let y_pred = self.base_time_secs + self.inv_throughput * x;
+
+        debug_assert!(y_pred > 0.);
+
+        let predicted_secs = (y_pred * avg_concurrent.max(1.)).max(0.);
         Duration::from_secs_f64(predicted_secs)
     }
 
@@ -148,12 +169,14 @@ mod tests {
 
     #[test]
     fn test_converges_to_constant_observation() {
-        let mut predictor = LatencyPredictor::new(Duration::from_secs_f64(10.0));
-        for _ in 0..10 {
-            predictor.update(1000, Duration::from_secs_f64(1.0), 1.);
+        for concurrency in [1., 5., 100.] {
+            let mut predictor = LatencyPredictor::new(Duration::from_secs_f64(10.0));
+            for _ in 0..10 {
+                predictor.update(1000, Duration::from_secs_f64(1.0), concurrency);
+            }
+            let prediction = predictor.predicted_latency(1000, concurrency);
+            assert!((prediction.as_secs_f64() - 1.0).abs() < 0.01);
         }
-        let prediction = predictor.predicted_latency(1000, 1.);
-        assert!((prediction.as_secs_f64() - 1.0).abs() < 0.01);
     }
 
     #[tokio::test]

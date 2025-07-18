@@ -150,8 +150,20 @@ impl AdaptiveConcurrencyController {
                         .as_secs_f64()
                         .max(1e-4);
 
-                    (t_actual / t_pred).min(*CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY)
+                    let dev_ratio = (t_actual / t_pred).min(*CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY);
+
+                    eprintln!(
+                        "success = {is_succes}; t_pred = {t_pred}; t_actual = {t_actual}; dev_ratio = {dev_ratio}"
+                    );
+
+                    state_lg
+                        .latency_predictor
+                        .update(n_bytes, actual_completion_time, avg_concurrency);
+
+                    dev_ratio
                 } else {
+                    eprintln!("failure, bytes known.");
+
                     // If it's not a success, then update the deviance with the penalty factor.
                     *CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY
                 }
@@ -159,9 +171,13 @@ impl AdaptiveConcurrencyController {
                 // This would be a failure case, so update the
                 debug_assert!(!is_succes);
 
+                eprintln!("failure, bytes unknown.");
+
                 *CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY
             }
         };
+
+        eprintln!("dev_ratio = {}; ln = {}", deviance_ratio, deviance_ratio.ln());
 
         // Update the deviance with this value; we're tracking the log of the ratio due
         // to the additive averaging.
@@ -202,7 +218,7 @@ impl AdaptiveConcurrencyController {
                 self.logging_tag,
                 self.concurrency_semaphore.total_permits(),
                 state_lg.latency_predictor.predicted_bandwidth(),
-                state_lg.prediction_deviance.value()
+                state_lg.prediction_deviance.value().exp()
             );
         }
     }
