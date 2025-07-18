@@ -26,4 +26,4 @@ pub mod remote_client;
 mod retry_wrapper;
 mod upload_progress_stream;
 
-mod adaptive_concurrency_control;
+mod adaptive_concurrency;

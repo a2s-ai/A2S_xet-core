@@ -55,6 +55,12 @@ impl AdjustableSemaphore {
         self.semaphore.available_permits()
     }
 
+    pub fn active_permits(&self) -> usize {
+        // The number of total permits minus the available permits, not counting for the enqueud permit decreases.
+        (self.total_permits() + self.enqueued_permit_decreases.load(std::sync::atomic::Ordering::Relaxed))
+            .saturating_sub(self.available_permits())
+    }
+
     pub async fn acquire(self: &Arc<Self>) -> Result<AdjustableSemaphorePermit, AcquireError> {
         // A few debug mode consistency checks.
         debug_assert!(self.semaphore.available_permits() <= self.max_permits);

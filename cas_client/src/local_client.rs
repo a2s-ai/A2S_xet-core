@@ -22,7 +22,7 @@ use tempfile::TempDir;
 use tokio::runtime::Handle;
 use tracing::{debug, error, info, warn};
 
-use crate::adaptive_concurrency_control::ConnectionPermit;
+use crate::adaptive_concurrency::ConnectionPermit;
 use crate::error::{CasClientError, Result};
 use crate::output_provider::OutputProvider;
 use crate::Client;

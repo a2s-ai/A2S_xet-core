@@ -9,7 +9,7 @@ use tokio_retry::strategy::{jitter, ExponentialBackoff};
 use tokio_retry::RetryIf;
 use tracing::{error, info};
 
-use crate::adaptive_concurrency_control::ConnectionPermit;
+use crate::adaptive_concurrency::ConnectionPermit;
 use crate::constants::{CLIENT_RETRY_BASE_DELAY_MS, CLIENT_RETRY_MAX_ATTEMPTS};
 use crate::error::CasClientError;
 use crate::http_client::request_id_from_response;

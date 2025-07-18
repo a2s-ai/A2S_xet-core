@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,18 +5,23 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 use tracing::{debug, info};
 use utils::adjustable_semaphore::{AdjustableSemaphore, AdjustableSemaphorePermit};
+use utils::ExpWeightedMovingAvg;
 
+use crate::adaptive_concurrency::latency_prediction::LatencyPredictor;
 use crate::constants::*;
 use crate::CasClientError;
 
 /// The internal state of the concurrency controller.
 struct ConcurrencyControllerState {
-    // A running tally of how many of the last transfers were within their target completion time.
-    tracked_successful_transfers: VecDeque<(Instant, bool)>,
+    /// A running model of the current bandwidth.  Uses an exponentially weighted average to predict the
+    latency_predictor: LatencyPredictor,
 
-    // Constants that determine controls on the tracking window
-    tracking_window_time: Duration,
-    tracking_window_size: usize,
+    // A running average of how far the latency prediction differs from the predicted latency.
+    // This is tracked as ln(actual / predicted).  Essentially, when this is less than zero --
+    // i.e. actual < predicted
+    // -- then we increase concurrency; when this is greater than ln(1.1)
+    // -- i.e. actual > 1.1 * predicted -- we decrease concurrency.
+    prediction_deviance: ExpWeightedMovingAvg,
 
     // The last time we adjusted the permits.
     last_adjustment_time: Instant,
@@ -28,15 +32,12 @@ struct ConcurrencyControllerState {
 
 impl ConcurrencyControllerState {
     fn new() -> Self {
-        let tracking_window_size = *CONCURRENCY_CONTROL_TRACKING_SIZE;
-        let tracking_window_time = Duration::from_millis(*CONCURRENCY_CONTROL_TRACKING_WINDOW_MS);
-
+        let emwa_half_life = Duration::from_millis(*CONCURRENCY_CONTROL_TRACKING_HALF_LIFE_MS);
         Self {
-            tracked_successful_transfers: VecDeque::with_capacity(tracking_window_size),
+            latency_predictor: LatencyPredictor::new(emwa_half_life),
+            prediction_deviance: ExpWeightedMovingAvg::new(emwa_half_life),
             last_adjustment_time: Instant::now(),
             last_logging_time: Instant::now(),
-            tracking_window_time,
-            tracking_window_size,
         }
     }
 }
@@ -70,16 +71,10 @@ impl ConcurrencyControllerState {
 pub struct AdaptiveConcurrencyController {
     // The current state, including tracking information and when previous adjustments were made.
     // Also holds related constants
-    state: Arc<Mutex<ConcurrencyControllerState>>,
+    state: Mutex<ConcurrencyControllerState>,
 
     // The semaphore from which new permits are issued.
     concurrency_semaphore: Arc<AdjustableSemaphore>,
-
-    // Constants determining whether a transfer is a success (succeeds and within time limit) or a
-    // failure.
-    target_time_large: Duration,
-    target_time_small: Duration,
-    large_transfer_n_bytes: u64,
 
     // constants used to calculate how long things should be expected to take.
     min_concurrency_increase_delay: Duration,
@@ -99,11 +94,8 @@ impl AdaptiveConcurrencyController {
         info!("Initializing Adaptive Concurrency Controller for {logging_tag} with starting concurrency = {current_concurrency}; min = {min_concurrency}, max = {max_concurrency}");
 
         Arc::new(Self {
-            state: Arc::new(Mutex::new(ConcurrencyControllerState::new())),
+            state: Mutex::new(ConcurrencyControllerState::new()),
             concurrency_semaphore: AdjustableSemaphore::new(current_concurrency, (min_concurrency, max_concurrency)),
-            target_time_large: Duration::from_millis(*CONCURRENCY_CONTROL_TARGET_TIME_LARGE_TRANSFER_MS),
-            target_time_small: Duration::from_millis(*CONCURRENCY_CONTROL_TARGET_TIME_SMALL_TRANSFER_MS),
-            large_transfer_n_bytes: *CONCURRENCY_CONTROL_LARGE_TRANSFER_NUM_BYTES,
 
             min_concurrency_increase_delay: Duration::from_millis(*CONCURRENCY_CONTROL_MIN_INCREASE_WINDOW_MS),
             min_concurrency_decrease_delay: Duration::from_millis(*CONCURRENCY_CONTROL_MIN_DECREASE_WINDOW_MS),
@@ -119,6 +111,7 @@ impl AdaptiveConcurrencyController {
             permit,
             controller: Arc::clone(self),
             transfer_start_time: Instant::now(),
+            starting_concurrency: self.concurrency_semaphore.active_permits(),
         })
     }
 
@@ -132,107 +125,86 @@ impl AdaptiveConcurrencyController {
     pub fn available_permits(&self) -> usize {
         self.concurrency_semaphore.available_permits()
     }
-}
 
-impl ConcurrencyControllerState {
-    /// Add a new report to the state, returning the current success ratio
-    fn add_report(&mut self, success: bool) -> f64 {
-        // Refine to the current size.
-        if self.tracked_successful_transfers.len() == self.tracking_window_size {
-            self.tracked_successful_transfers.pop_front();
-        }
-
-        // Refine to the current time window.
-        while let Some((ts, _)) = self.tracked_successful_transfers.front() {
-            if ts.elapsed() > self.tracking_window_time {
-                self.tracked_successful_transfers.pop_front();
-            } else {
-                break;
-            }
-        }
-
-        self.tracked_successful_transfers.push_back((Instant::now(), success));
-
-        // Now calculate the current success ratio.
-        let n = self.tracked_successful_transfers.len();
-
-        let success_count: usize = self.tracked_successful_transfers.iter().map(|b| if b.1 { 1 } else { 0 }).sum();
-
-        (success_count as f64) / (n as f64)
-    }
-}
-
-impl AdaptiveConcurrencyController {
-    /// Consider an adjustment to the concurrency if possible.
-    async fn update_concurrency(&self, success: bool) {
+    /// Update  
+    async fn report_and_update(
+        &self,
+        actual_completion_time: Duration,
+        starting_concurrency: usize,
+        n_bytes_if_known: Option<u64>,
+        is_succes: bool,
+    ) {
         let mut state_lg = self.state.lock().await;
 
-        let success_ratio = state_lg.add_report(success);
+        // First, calculate the predicted vs. actual time completion for this model.
+        let deviance_ratio = {
+            if let Some(n_bytes) = n_bytes_if_known {
+                let cur_concurrency = self.concurrency_semaphore.active_permits();
+                let avg_concurrency = ((cur_concurrency + starting_concurrency) as f64) / 2.;
 
-        if success && (success_ratio > *CONCURRENCY_CONTROL_TARGET_SUCCESS_RATIO_UPPER) {
-            // Consider adjusting the concurrency
-            if state_lg.last_adjustment_time.elapsed() > self.min_concurrency_increase_delay {
-                // Enough time has passed, so add a new permit.
-                if self.concurrency_semaphore.increment_total_permits() {
-                    state_lg.last_adjustment_time = Instant::now();
-                    debug!(
-                        "Increasing concurrency for {} to {} due to successful completion and success_ratio = {:.2}",
-                        self.logging_tag,
-                        self.concurrency_semaphore.total_permits(),
-                        success_ratio
-                    );
+                if is_succes {
+                    let t_actual = actual_completion_time.as_secs_f64().max(1e-4);
+                    let t_pred = state_lg
+                        .latency_predictor
+                        .predicted_latency(n_bytes, avg_concurrency)
+                        .as_secs_f64()
+                        .max(1e-4);
+
+                    (t_actual / t_pred).min(*CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY)
+                } else {
+                    // If it's not a success, then update the deviance with the penalty factor.
+                    *CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY
                 }
+            } else {
+                // This would be a failure case, so update the
+                debug_assert!(!is_succes);
+
+                *CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY
             }
-        } else if !success && (success_ratio < *CONCURRENCY_CONTROL_TARGET_SUCCESS_RATIO_LOWER) {
-            // Had a failure, so attempt to decrease the number of permits.
+        };
+
+        // Update the deviance with this value; we're tracking the log of the ratio due
+        // to the additive averaging.
+        state_lg.prediction_deviance.update(deviance_ratio.ln());
+
+        // Now, get the current predicted deviance and see what the range is.
+        let cur_deviance = state_lg.prediction_deviance.value().exp();
+
+        if is_succes && cur_deviance < *CONCURRENCY_CONTROL_CONCURRENCY_INCREASABLE_DEVIANCE {
+            // Attempt to increase the deviance.
+            if state_lg.last_adjustment_time.elapsed() > self.min_concurrency_increase_delay {
+                self.concurrency_semaphore.increment_total_permits();
+                state_lg.last_adjustment_time = Instant::now();
+
+                eprintln!(
+                    "Concurrency control for {}: Increased concurrency to {}; latency deviance = {cur_deviance}.",
+                    self.logging_tag,
+                    self.concurrency_semaphore.total_permits()
+                );
+            }
+        } else if cur_deviance > *CONCURRENCY_CONTROL_ACCEPTABLE_DEVIANCE {
+            // Attempt to decrease the deviance.
             if state_lg.last_adjustment_time.elapsed() > self.min_concurrency_decrease_delay {
-                // Enough time has passed, so add a new permit.
-                if self.concurrency_semaphore.decrement_total_permits() {
-                    state_lg.last_adjustment_time = Instant::now();
-                    debug!(
-                        "Decreasing concurrency for {} to {} due to failed transfer with success_ration = {success_ratio:.2}",
-                        self.logging_tag,
-                        self.concurrency_semaphore.total_permits()
-                    );
-                }
+                self.concurrency_semaphore.decrement_total_permits();
+                state_lg.last_adjustment_time = Instant::now();
+
+                eprintln!(
+                    "Concurrency control for {}:Lowered concurrency to {}; latency deviance = {cur_deviance}.",
+                    self.logging_tag,
+                    self.concurrency_semaphore.total_permits()
+                );
             }
         }
 
         if state_lg.last_logging_time.elapsed() > Duration::from_millis(*CONCURRENCY_CONTROL_LOGGING_INTERVAL_MS) {
-            info!(
-                "Concurrency for {} at {}; current success ratio = {success_ratio:.2}",
+            eprintln!(
+                "Concurrency control for {}: Current concurrency = {}; predicted bandwidth = {}; deviance = {}",
                 self.logging_tag,
-                self.concurrency_semaphore.total_permits()
+                self.concurrency_semaphore.total_permits(),
+                state_lg.latency_predictor.predicted_bandwidth(),
+                state_lg.prediction_deviance.value()
             );
-            state_lg.last_logging_time = Instant::now()
         }
-    }
-
-    /// Record a failure related to connection speed (e.g. a timeout) that will be retried.  
-    /// With this, we can't decrease the number of permits, so just record there has been a failure.
-    async fn report_retryable_failure(&self) {
-        self.update_concurrency(false).await;
-    }
-
-    /// Report task completion.
-    async fn report_completion(&self, conn_permit: ConnectionPermit, n_bytes: u64, success: bool) {
-        // Did this complete in the target time window?
-        let duration = conn_permit.transfer_start_time.elapsed();
-
-        // Is this transfer within the target time window?
-        let success = success && (duration < self.target_duration(n_bytes));
-
-        // Attempt an adjustment
-        self.update_concurrency(success).await;
-    }
-
-    /// The target max duration for a transfer.
-    fn target_duration(&self, n_bytes: u64) -> Duration {
-        let a = self.target_time_small.as_secs_f64();
-        let b = self.target_time_large.as_secs_f64();
-        let s = ((n_bytes as f64) / (self.large_transfer_n_bytes as f64)).clamp(0., 1.);
-
-        Duration::from_secs_f64(a + s * (b - a))
     }
 }
 
@@ -242,6 +214,7 @@ pub struct ConnectionPermit {
     permit: AdjustableSemaphorePermit,
     controller: Arc<AdaptiveConcurrencyController>,
     transfer_start_time: Instant,
+    starting_concurrency: usize,
 }
 
 impl ConnectionPermit {
@@ -252,39 +225,46 @@ impl ConnectionPermit {
 
     /// Call this after a successful transfer, providing the byte count.
     pub(crate) async fn report_completion(self, n_bytes: u64, success: bool) {
-        self.controller.clone().report_completion(self, n_bytes, success).await;
+        self.controller
+            .clone()
+            .report_and_update(self.transfer_start_time.elapsed(), self.starting_concurrency, Some(n_bytes), success)
+            .await;
     }
 
     pub(crate) async fn report_retryable_failure(&self) {
-        self.controller.report_retryable_failure().await;
+        self.controller
+            .clone()
+            .report_and_update(self.transfer_start_time.elapsed(), self.starting_concurrency, None, false)
+            .await;
     }
 }
 
 // Testing routines.
-
 #[cfg(test)]
 mod test_constants {
 
-    pub const TARGET_TIME_MS_L: u64 = 20;
-    pub const TARGET_TIME_MS_S: u64 = 5;
+    pub const TR_HALF_LIFE_MS: u64 = 10;
     pub const INCR_SPACING_MS: u64 = 4;
     pub const DECR_SPACING_MS: u64 = 2;
-    pub const TRACKING_WINDOW_MS: u64 = 200;
-    pub const TRACKING_WINDOW_SIZE: usize = 16;
-    pub const LARGE_N_BYTES: u64 = 1000;
+
+    pub const TARGET_TIME_MS_S: u64 = 5;
+    pub const TARGET_TIME_MS_L: u64 = 20;
+
+    pub const LARGE_N_BYTES: u64 = 10000;
 }
 
 #[cfg(test)]
 impl ConcurrencyControllerState {
+    #[cfg(test)]
     fn new_testing() -> Self {
-        let tracking_window_size = test_constants::TRACKING_WINDOW_SIZE;
-        let tracking_window_time = Duration::from_millis(test_constants::TRACKING_WINDOW_MS);
+        use crate::adaptive_concurrency::controller::test_constants::TR_HALF_LIFE_MS;
+
+        let emwa_half_life = Duration::from_millis(TR_HALF_LIFE_MS);
 
         Self {
-            tracked_successful_transfers: VecDeque::with_capacity(tracking_window_size),
+            latency_predictor: LatencyPredictor::new(emwa_half_life),
+            prediction_deviance: ExpWeightedMovingAvg::new(emwa_half_life),
             last_adjustment_time: Instant::now(),
-            tracking_window_time,
-            tracking_window_size,
             last_logging_time: Instant::now(),
         }
     }
@@ -295,20 +275,12 @@ impl AdaptiveConcurrencyController {
     pub fn new_testing(concurrency: usize, concurrency_bounds: (usize, usize)) -> Arc<Self> {
         Arc::new(Self {
             // Start with 2x the minimum; increase over time.
-            state: Arc::new(Mutex::new(ConcurrencyControllerState::new_testing())),
+            state: Mutex::new(ConcurrencyControllerState::new_testing()),
             concurrency_semaphore: AdjustableSemaphore::new(concurrency, concurrency_bounds),
-            target_time_large: Duration::from_millis(test_constants::TARGET_TIME_MS_L),
-            target_time_small: Duration::from_millis(test_constants::TARGET_TIME_MS_S),
-            large_transfer_n_bytes: test_constants::LARGE_N_BYTES,
             min_concurrency_increase_delay: Duration::from_millis(test_constants::INCR_SPACING_MS),
             min_concurrency_decrease_delay: Duration::from_millis(test_constants::DECR_SPACING_MS),
             logging_tag: "testing",
         })
-    }
-
-    pub async fn set_tracked(&self, tracked_state: &[bool]) {
-        self.state.lock().await.tracked_successful_transfers =
-            tracked_state.iter().map(|ts| (Instant::now(), *ts)).collect();
     }
 }
 
@@ -319,6 +291,8 @@ mod tests {
     use super::test_constants::*;
     use super::*;
 
+    pub const B: u64 = 1000;
+
     #[tokio::test]
     async fn test_permit_increase_to_max_on_repeated_success() {
         time::pause();
@@ -328,7 +302,7 @@ mod tests {
         for _ in 0..10 {
             let permit = controller.acquire_connection_permit().await.unwrap();
             advance(Duration::from_millis(1)).await;
-            permit.report_completion(LARGE_N_BYTES, true).await;
+            permit.report_completion(B, true).await;
             advance(Duration::from_millis(INCR_SPACING_MS + 1)).await;
         }
 
@@ -351,7 +325,7 @@ mod tests {
         while t.elapsed() < Duration::from_millis(INCR_SPACING_MS + 2) {
             let permit = controller.acquire_connection_permit().await.unwrap();
             advance(Duration::from_millis(1)).await;
-            permit.report_completion(LARGE_N_BYTES, true).await;
+            permit.report_completion(B, true).await;
         }
 
         // The window above should have had exactly two increases; one at the first success and one within the next
@@ -393,52 +367,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_permit_decrease_on_success_but_too_slow() {
-        time::pause();
-
-        let controller = AdaptiveConcurrencyController::new_testing(10, (5, 10));
-
-        for i in 1..=5 {
-            advance(Duration::from_millis(DECR_SPACING_MS + 1)).await;
-
-            let permit = controller.acquire_connection_permit().await.unwrap();
-
-            advance(Duration::from_millis(TARGET_TIME_MS_S + 1)).await;
-
-            // This was successful, but too slow for a small packet, so it should decrease the concurrancy.
-            permit.report_completion(0, true).await;
-
-            let p = controller.available_permits();
-            assert_eq!(p, 10 - i);
-        }
-
-        let ending = controller.available_permits();
-        assert_eq!(ending, 5);
-    }
-
-    #[tokio::test]
-    async fn test_decrease_on_mixed_results() {
-        time::pause();
-
-        let controller = AdaptiveConcurrencyController::new_testing(3, (2, 4));
-
-        for i in 0..10 {
-            let permit = controller.acquire_connection_permit().await.unwrap();
-            if i % 2 == 0 {
-                advance(Duration::from_millis(1)).await;
-                permit.report_completion(LARGE_N_BYTES, true).await;
-            } else {
-                advance(Duration::from_millis(TARGET_TIME_MS_L + 10)).await;
-                permit.report_completion(LARGE_N_BYTES, true).await;
-            }
-            advance(Duration::from_millis(INCR_SPACING_MS + DECR_SPACING_MS)).await;
-        }
-
-        let final_permits = controller.available_permits();
-        assert_eq!(final_permits, 2);
-    }
-
-    #[tokio::test]
     async fn test_retryable_failures_count_against_success() {
         time::pause();
 
@@ -465,7 +393,7 @@ mod tests {
 
         // Acquire the rest of the permits.
         let permit_1 = controller.acquire_connection_permit().await.unwrap();
-        let permit_2 = controller.acquire_connection_permit().await.unwrap();
+        let _permit_2 = controller.acquire_connection_permit().await.unwrap();
 
         assert_eq!(controller.total_permits(), 3);
         assert_eq!(controller.available_permits(), 0);
@@ -483,21 +411,9 @@ mod tests {
         assert_eq!(controller.total_permits(), 2);
         assert_eq!(controller.available_permits(), 0);
 
-        // A success, but due to the previous number of reported failures, should still
-        // cause a decrease.
-        advance(Duration::from_millis(DECR_SPACING_MS + 1)).await;
-        permit_2.report_completion(0, true).await;
-
-        assert_eq!(controller.total_permits(), 1);
-        assert_eq!(controller.available_permits(), 0);
-
         // Shouldn't cause a change due to previous change happening immediately before this.
         permit_1.report_completion(0, true).await;
-        assert_eq!(controller.total_permits(), 1);
+        assert_eq!(controller.total_permits(), 2);
         assert_eq!(controller.available_permits(), 1);
-
-        // Set the controller state to all true.
-        controller.set_tracked(&[true]).await;
-        advance(Duration::from_millis(INCR_SPACING_MS + DECR_SPACING_MS + 1)).await;
     }
 }

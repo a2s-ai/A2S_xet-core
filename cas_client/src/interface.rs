@@ -9,7 +9,7 @@ use merklehash::MerkleHash;
 use progress_tracking::item_tracking::SingleItemProgressUpdater;
 use progress_tracking::upload_tracking::CompletionTracker;
 
-use crate::adaptive_concurrency_control::{AdaptiveConcurrencyController, ConnectionPermit};
+use crate::adaptive_concurrency::{AdaptiveConcurrencyController, ConnectionPermit};
 use crate::constants::{MAX_CONCURRENT_UPLOADS, MIN_CONCURRENT_UPLOADS, NUM_INITIAL_CONCURRENT_UPLOADS};
 use crate::error::Result;
 #[cfg(not(target_family = "wasm"))]

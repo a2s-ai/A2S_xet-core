@@ -28,7 +28,7 @@ use utils::auth::AuthConfig;
 #[cfg(not(target_family = "wasm"))]
 use utils::singleflight::Group;
 
-use crate::adaptive_concurrency_control::ConnectionPermit;
+use crate::adaptive_concurrency::ConnectionPermit;
 #[cfg(not(target_family = "wasm"))]
 use crate::download_utils::*;
 use crate::error::{CasClientError, Result};
