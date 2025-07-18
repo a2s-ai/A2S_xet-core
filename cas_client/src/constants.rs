@@ -30,16 +30,12 @@ utils::configurable_constants! {
     /// how accurate the model is.  The primary assumption here is the following:
     ///
     ///
-    ref CONCURRENCY_CONTROL_TRACKING_HALF_LIFE_MS : u64 = 30 * 1000;
-
-    ref CONCURRENCY_CONTROL_ACCEPTABLE_DEVIANCE : f64 = 1.1;
-
-    ref CONCURRENCY_CONTROL_CONCURRENCY_INCREASABLE_DEVIANCE: f64 = 1.05;
-
-    /// A failure -- a retry or outright failure -- counts as this weight.
-    ref CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY : f64 = 1.4;
+    ref CONCURRENCY_CONTROL_LATENCY_TRACKING_HALF_LIFE_MS : u64 = 30 * 1000;
+    ref CONCURRENCY_CONTROL_SUCCESS_TRACKING_HALF_LIFE_MS : u64 = 10 * 1000;
 
 
+    ref CONCURRENCY_CONTROL_DEVIANCE_TARGET_SPREAD : f64 = 0.05;
+    ref CONCURRENCY_CONTROL_DEVIANCE_MAX_SPREAD : f64 = 0.3;
 
     /// Log the concurrency on this interval.
     ref CONCURRENCY_CONTROL_LOGGING_INTERVAL_MS: u64 = 10 * 1000;
@@ -54,5 +50,5 @@ utils::configurable_constants! {
 
     /// The starting number of concurrent upload streams, which will increase up to MAX_CONCURRENT_UPLOADS
     /// on successful completions.
-    ref NUM_INITIAL_CONCURRENT_UPLOADS: usize = 16;
+    ref NUM_INITIAL_CONCURRENT_UPLOADS: usize = 4;
 }

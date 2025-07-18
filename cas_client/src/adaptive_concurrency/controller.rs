@@ -7,7 +7,7 @@ use tracing::{debug, info};
 use utils::adjustable_semaphore::{AdjustableSemaphore, AdjustableSemaphorePermit};
 use utils::ExpWeightedMovingAvg;
 
-use crate::adaptive_concurrency::latency_prediction::LatencyPredictor;
+use crate::adaptive_concurrency::latency_prediction::{LatencyPredictor, LatencyPredictorSnapshot};
 use crate::constants::*;
 use crate::CasClientError;
 
@@ -21,7 +21,7 @@ struct ConcurrencyControllerState {
     // i.e. actual < predicted
     // -- then we increase concurrency; when this is greater than ln(1.1)
     // -- i.e. actual > 1.1 * predicted -- we decrease concurrency.
-    prediction_deviance: ExpWeightedMovingAvg,
+    deviance_tracking: ExpWeightedMovingAvg,
 
     // The last time we adjusted the permits.
     last_adjustment_time: Instant,
@@ -32,10 +32,12 @@ struct ConcurrencyControllerState {
 
 impl ConcurrencyControllerState {
     fn new() -> Self {
-        let emwa_half_life = Duration::from_millis(*CONCURRENCY_CONTROL_TRACKING_HALF_LIFE_MS);
+        let latency_half_life = Duration::from_millis(*CONCURRENCY_CONTROL_LATENCY_TRACKING_HALF_LIFE_MS);
+        let success_half_life = Duration::from_millis(*CONCURRENCY_CONTROL_SUCCESS_TRACKING_HALF_LIFE_MS);
+
         Self {
-            latency_predictor: LatencyPredictor::new(emwa_half_life),
-            prediction_deviance: ExpWeightedMovingAvg::new(emwa_half_life),
+            latency_predictor: LatencyPredictor::new(latency_half_life),
+            deviance_tracking: ExpWeightedMovingAvg::new(success_half_life),
             last_adjustment_time: Instant::now(),
             last_logging_time: Instant::now(),
         }
@@ -112,6 +114,7 @@ impl AdaptiveConcurrencyController {
             controller: Arc::clone(self),
             transfer_start_time: Instant::now(),
             starting_concurrency: self.concurrency_semaphore.active_permits(),
+            latency_model_at_start: self.state.lock().await.latency_predictor.model_snapshot(),
         })
     }
 
@@ -127,53 +130,59 @@ impl AdaptiveConcurrencyController {
     }
 
     /// Update  
-    async fn report_and_update(
-        &self,
-        actual_completion_time: Duration,
-        starting_concurrency: usize,
-        n_bytes_if_known: Option<u64>,
-        is_succes: bool,
-    ) {
+    async fn report_and_update(&self, permit: &ConnectionPermit, n_bytes_if_known: Option<u64>, is_success: bool) {
+        let actual_completion_time = permit.transfer_start_time.elapsed();
+
         let mut state_lg = self.state.lock().await;
+
+        let max_dev = 1. + CONCURRENCY_CONTROL_DEVIANCE_MAX_SPREAD.max(0.);
+        let min_dev = 1. / max_dev;
+
+        let ok_dev = 1. + CONCURRENCY_CONTROL_DEVIANCE_TARGET_SPREAD.max(0.);
+        let incr_dev = 1. / ok_dev;
 
         // First, calculate the predicted vs. actual time completion for this model.
         let deviance_ratio = {
             if let Some(n_bytes) = n_bytes_if_known {
                 let cur_concurrency = self.concurrency_semaphore.active_permits();
-                let avg_concurrency = ((cur_concurrency + starting_concurrency) as f64) / 2.;
+                let avg_concurrency = ((cur_concurrency + permit.starting_concurrency) as f64) / 2.;
 
-                if is_succes {
+                if is_success {
                     let t_actual = actual_completion_time.as_secs_f64().max(1e-4);
-                    let t_pred = state_lg
-                        .latency_predictor
-                        .predicted_latency(n_bytes, avg_concurrency)
-                        .as_secs_f64()
-                        .max(1e-4);
 
-                    let dev_ratio = (t_actual / t_pred).min(*CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY);
+                    let concurrency = permit.starting_concurrency as f64;
 
-                    eprintln!(
-                        "success = {is_succes}; t_pred = {t_pred}; t_actual = {t_actual}; dev_ratio = {dev_ratio}"
-                    );
+                    // Get the predicted time using the model when this started.
+                    let t_pred = permit
+                        .latency_model_at_start
+                        .as_ref()
+                        .map(|lm| lm.predicted_latency(n_bytes, concurrency))
+                        .unwrap_or(t_actual);
+
+                    let dev_ratio = t_actual / t_pred.max(1e-6);
 
                     state_lg
                         .latency_predictor
                         .update(n_bytes, actual_completion_time, avg_concurrency);
+
+                    eprintln!(
+                        "success = {is_success}; n_bytes={n_bytes}, avg_con = {avg_concurrency}, t_pred = {t_pred}; t_actual = {t_actual}; dev_ratio = {dev_ratio}"
+                    );
 
                     dev_ratio
                 } else {
                     eprintln!("failure, bytes known.");
 
                     // If it's not a success, then update the deviance with the penalty factor.
-                    *CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY
+                    max_dev
                 }
             } else {
                 // This would be a failure case, so update the
-                debug_assert!(!is_succes);
+                debug_assert!(!is_success);
 
                 eprintln!("failure, bytes unknown.");
 
-                *CONCURRENCY_CONTROL_FAILURE_DEVIANCE_PENALTY
+                max_dev
             }
         };
 
@@ -181,12 +190,12 @@ impl AdaptiveConcurrencyController {
 
         // Update the deviance with this value; we're tracking the log of the ratio due
         // to the additive averaging.
-        state_lg.prediction_deviance.update(deviance_ratio.ln());
+        state_lg.deviance_tracking.update(deviance_ratio.clamp(min_dev, max_dev).ln()); // deviance_ratio.ln());
 
         // Now, get the current predicted deviance and see what the range is.
-        let cur_deviance = state_lg.prediction_deviance.value().exp();
+        let cur_deviance = state_lg.deviance_tracking.value().exp();
 
-        if is_succes && cur_deviance < *CONCURRENCY_CONTROL_CONCURRENCY_INCREASABLE_DEVIANCE {
+        if is_success && cur_deviance < incr_dev {
             // Attempt to increase the deviance.
             if state_lg.last_adjustment_time.elapsed() > self.min_concurrency_increase_delay {
                 self.concurrency_semaphore.increment_total_permits();
@@ -198,14 +207,14 @@ impl AdaptiveConcurrencyController {
                     self.concurrency_semaphore.total_permits()
                 );
             }
-        } else if cur_deviance > *CONCURRENCY_CONTROL_ACCEPTABLE_DEVIANCE {
+        } else if !is_success && cur_deviance > ok_dev {
             // Attempt to decrease the deviance.
             if state_lg.last_adjustment_time.elapsed() > self.min_concurrency_decrease_delay {
                 self.concurrency_semaphore.decrement_total_permits();
                 state_lg.last_adjustment_time = Instant::now();
 
                 eprintln!(
-                    "Concurrency control for {}:Lowered concurrency to {}; latency deviance = {cur_deviance}.",
+                    "Concurrency control for {}: Lowered concurrency to {}; latency deviance = {cur_deviance}.",
                     self.logging_tag,
                     self.concurrency_semaphore.total_permits()
                 );
@@ -217,8 +226,8 @@ impl AdaptiveConcurrencyController {
                 "Concurrency control for {}: Current concurrency = {}; predicted bandwidth = {}; deviance = {}",
                 self.logging_tag,
                 self.concurrency_semaphore.total_permits(),
-                state_lg.latency_predictor.predicted_bandwidth(),
-                state_lg.prediction_deviance.value().exp()
+                state_lg.latency_predictor.predicted_bandwidth().unwrap_or_default(),
+                state_lg.deviance_tracking.value().exp()
             );
         }
     }
@@ -231,6 +240,7 @@ pub struct ConnectionPermit {
     controller: Arc<AdaptiveConcurrencyController>,
     transfer_start_time: Instant,
     starting_concurrency: usize,
+    latency_model_at_start: Option<LatencyPredictorSnapshot>,
 }
 
 impl ConnectionPermit {
@@ -241,17 +251,11 @@ impl ConnectionPermit {
 
     /// Call this after a successful transfer, providing the byte count.
     pub(crate) async fn report_completion(self, n_bytes: u64, success: bool) {
-        self.controller
-            .clone()
-            .report_and_update(self.transfer_start_time.elapsed(), self.starting_concurrency, Some(n_bytes), success)
-            .await;
+        self.controller.clone().report_and_update(&self, Some(n_bytes), success).await;
     }
 
     pub(crate) async fn report_retryable_failure(&self) {
-        self.controller
-            .clone()
-            .report_and_update(self.transfer_start_time.elapsed(), self.starting_concurrency, None, false)
-            .await;
+        self.controller.clone().report_and_update(&self, None, false).await;
     }
 }
 
@@ -279,7 +283,7 @@ impl ConcurrencyControllerState {
 
         Self {
             latency_predictor: LatencyPredictor::new(emwa_half_life),
-            prediction_deviance: ExpWeightedMovingAvg::new(emwa_half_life),
+            deviance_tracking: ExpWeightedMovingAvg::new(emwa_half_life),
             last_adjustment_time: Instant::now(),
             last_logging_time: Instant::now(),
         }
