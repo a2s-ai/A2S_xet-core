@@ -64,8 +64,6 @@ impl ConcurrencyControllerState {
 /// predicted time and the actual time, and increase the concurrency when this is reliably sublinear and decrease it
 /// when it is superlinear.  This is clipped to avoid having a single observation weight it too much; failures
 /// and retries max out the deviance.
-///
-///
 pub struct AdaptiveConcurrencyController {
     // The current state, including tracking information and when previous adjustments were made.
     // Also holds related constants
@@ -161,14 +159,8 @@ impl AdaptiveConcurrencyController {
                         .latency_predictor
                         .update(n_bytes, actual_completion_time, avg_concurrency);
 
-                    eprintln!(
-                        "success = {is_success}; n_bytes={n_bytes}, avg_con = {avg_concurrency}, t_pred = {t_pred}; t_actual = {t_actual}; dev_ratio = {dev_ratio}"
-                    );
-
                     dev_ratio
                 } else {
-                    eprintln!("failure, bytes known.");
-
                     // If it's not a success, then update the deviance with the penalty factor.
                     max_dev
                 }
@@ -176,13 +168,9 @@ impl AdaptiveConcurrencyController {
                 // This would be a failure case, so update the
                 debug_assert!(!is_success);
 
-                eprintln!("failure, bytes unknown.");
-
                 max_dev
             }
         };
-
-        eprintln!("dev_ratio = {}; ln = {}", deviance_ratio, deviance_ratio.ln());
 
         // Update the deviance with this value; we're tracking the log of the ratio due
         // to the additive averaging.
@@ -197,7 +185,7 @@ impl AdaptiveConcurrencyController {
                 self.concurrency_semaphore.increment_total_permits();
                 state_lg.last_adjustment_time = Instant::now();
 
-                eprintln!(
+                debug!(
                     "Concurrency control for {}: Increased concurrency to {}; latency deviance = {cur_deviance}.",
                     self.logging_tag,
                     self.concurrency_semaphore.total_permits()
@@ -209,7 +197,7 @@ impl AdaptiveConcurrencyController {
                 self.concurrency_semaphore.decrement_total_permits();
                 state_lg.last_adjustment_time = Instant::now();
 
-                eprintln!(
+                debug!(
                     "Concurrency control for {}: Lowered concurrency to {}; latency deviance = {cur_deviance}.",
                     self.logging_tag,
                     self.concurrency_semaphore.total_permits()
@@ -218,7 +206,7 @@ impl AdaptiveConcurrencyController {
         }
 
         if state_lg.last_logging_time.elapsed() > Duration::from_millis(*CONCURRENCY_CONTROL_LOGGING_INTERVAL_MS) {
-            eprintln!(
+            info!(
                 "Concurrency control for {}: Current concurrency = {}; predicted bandwidth = {}; deviance = {}",
                 self.logging_tag,
                 self.concurrency_semaphore.total_permits(),

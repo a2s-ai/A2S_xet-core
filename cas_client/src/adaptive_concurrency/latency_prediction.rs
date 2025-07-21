@@ -113,14 +113,6 @@ impl LatencyPredictor {
         // re-fit under nonneg constraints
         self.refit_nonneg();
 
-        eprintln!(
-            "On Update: sw={}, base_time_sec={}, slope={}, bandwidth={}",
-            self.sw,
-            self.base_time_secs,
-            self.inv_throughput_secs_per_mib,
-            self.predicted_bandwidth().unwrap_or_default()
-        );
-
         self.last_update = now;
     }
 
