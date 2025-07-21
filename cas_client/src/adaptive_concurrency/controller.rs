@@ -44,32 +44,28 @@ impl ConcurrencyControllerState {
     }
 }
 
-/// A controller for robustly adjusting the amount of concurrancy on upload and download paths.
+/// A controller for dynamically adjusting the amount of concurrancy on upload and download paths.
 ///
-/// By default, the controller dynamically adjusts the concurrency within bounds so that between 70%
-/// and 90%  of the transfers are completed within 20 seconds; it increases the concurrency as long as
-/// this criteria is met.  When more than 20% of the transfers begin taking longer than that, concurrency
-/// is reduced. Concurrency adjustments are throttled so that increasing the concurrency happens only every
-/// 500ms, and decreasing it happens at most once every 250ms.   (These values are all defaults; see
-/// the constants and their definitions in constants.rs).
-///  
-/// More formally:
-///  
-/// A "success" is a transfer that completed successfully within a specified amount of time that
-/// is determined by the size of the transfer.  
-///   - For 64MB uploads and downloads, this is defined as completion within
-///     CONCURRENCY_CONTROL_TARGET_TIME_LARGE_TRANSFER_MS.
-///   - For 0B transfers, this is defined as CONCURRENCY_CONTROL_TARGET_TIME_SMALL_TRANSFER_MS.
-///   - The expected time is scaled linearly between these two endpoints based on size.
+/// This controller uses two statistical models that adapt over time using exponentially weighted
+/// moving averages.  The first is a model that predicts the overall current bandwith, and the second is
+/// a model of how many transfers complete within the predicted time.
 ///
-/// The last CONCURRENCY_CONTROL_TRACKING_SIZE successess or failures are tracked to estimate the
-/// success_ratio, and only events within CONCURRENCY_CONTROL_TRACKING_WINDOW_MS are considered.  A
-/// retry attempt is counted as a failure.
+/// The key insight is this:
+/// 1. When a network connection is underutilized, the latency scales sublinearly with the number of parallel
+///    connections. In other words, adding another transfer does not affect the speed of the other transfers
+///    significantly.
+/// 2. When a network connection is fully utilized, then the latency scales linearly with the concurrency. In other
+///    words, adding increasing the concurrency from N to N+1 would cause the latency of all the other transfers to
+///    increase by a factor of (N+1) / N.
+/// 3. When a network connection is oversaturated, then the latency scales superlinearly -- in other words, adding an
+///    additional connection causes the overall throughput to decrease.
 ///
-/// When a transfer is completed, the concurrency is updated based on the recent success_ratio and
-/// whether that transfer was a success.  However, increases are made at most once every
-/// CONCURRENCY_CONTROL_MIN_INCREASE_WINDOW_MS and decreases at most every
-/// CONCURRENCY_CONTROL_MIN_DECREASE_WINDOW_MS.
+/// Now, because latency is a noisy observation, we track a running clipped average of the deviance between
+/// predicted time and the actual time, and increase the concurrency when this is reliably sublinear and decrease it
+/// when it is superlinear.  This is clipped to avoid having a single observation weight it too much; failures
+/// and retries max out the deviance.
+///
+///
 pub struct AdaptiveConcurrencyController {
     // The current state, including tracking information and when previous adjustments were made.
     // Also holds related constants
