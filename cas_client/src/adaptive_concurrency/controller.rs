@@ -239,7 +239,7 @@ impl ConnectionPermit {
     }
 
     pub(crate) async fn report_retryable_failure(&self) {
-        self.controller.clone().report_and_update(&self, None, false).await;
+        self.controller.clone().report_and_update(self, None, false).await;
     }
 }
 
@@ -248,8 +248,8 @@ impl ConnectionPermit {
 mod test_constants {
 
     pub const TR_HALF_LIFE_MS: u64 = 10;
-    pub const INCR_SPACING_MS: u64 = 4;
-    pub const DECR_SPACING_MS: u64 = 2;
+    pub const INCR_SPACING_MS: u64 = 200;
+    pub const DECR_SPACING_MS: u64 = 100;
 
     pub const TARGET_TIME_MS_S: u64 = 5;
     pub const TARGET_TIME_MS_L: u64 = 20;
@@ -303,10 +303,12 @@ mod tests {
 
         let controller = AdaptiveConcurrencyController::new_testing(1, (1, 4));
 
-        for _ in 0..10 {
+        for i in 0..10 {
             let permit = controller.acquire_connection_permit().await.unwrap();
-            advance(Duration::from_millis(1)).await;
+            // Increase the duration, so we're always going faster than predicted
+            advance(Duration::from_millis(12 - i)).await;
             permit.report_completion(B, true).await;
+
             advance(Duration::from_millis(INCR_SPACING_MS + 1)).await;
         }
 
@@ -324,12 +326,30 @@ mod tests {
         // Advance on so that the first success will trigger an adjustment.
         advance(Duration::from_millis(INCR_SPACING_MS + 1)).await;
 
-        let t = Instant::now();
-
-        while t.elapsed() < Duration::from_millis(INCR_SPACING_MS + 2) {
+        for i in 0..5 {
             let permit = controller.acquire_connection_permit().await.unwrap();
-            advance(Duration::from_millis(1)).await;
+            // Increase the duration, so we're always going faster than predicted
+            advance(Duration::from_millis(12 - i)).await;
             permit.report_completion(B, true).await;
+
+            // Don't advance, so it should have only incremented by one as not enough time
+            // will have passed for more.
+        }
+
+        assert_eq!(controller.available_permits(), 2);
+        assert_eq!(controller.total_permits(), 2);
+
+        // Now, advance the clock by enough time to allow another change.
+        advance(Duration::from_millis(INCR_SPACING_MS + 1)).await;
+
+        for i in 5..10 {
+            let permit = controller.acquire_connection_permit().await.unwrap();
+            // Increase the duration, so we're always going faster than predicted
+            advance(Duration::from_millis(12 - i)).await;
+            permit.report_completion(B, true).await;
+
+            // Don't advance, so it should have only incremented by one as not enough time
+            // will have passed for more.
         }
 
         // The window above should have had exactly two increases; one at the first success and one within the next
@@ -337,6 +357,7 @@ mod tests {
         assert_eq!(controller.available_permits(), 3);
         assert_eq!(controller.total_permits(), 3);
     }
+
     #[tokio::test]
     async fn test_permit_increase_on_slow_but_good_enough() {
         time::pause();

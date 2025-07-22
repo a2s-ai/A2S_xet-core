@@ -78,14 +78,7 @@ impl LatencyPredictor {
     ///
     /// - `size_bytes`: the size of the completed transmission.
     /// - `duration`: the time taken to complete the transmission.
-    /// Updates the latency model with a new observation.
-    ///
-    /// Applies exponential decay to prior statistics and incorporates the new sample
-    /// using a numerically stable linear regression formula.
-    ///
-    /// - `size_bytes`: the size of the completed transmission.
-    /// - `duration`: the time taken to complete the transmission.
-    /// - `n_concurrent`: the number of concurrent connections at the time.
+    /// - `avg_concurrent`: an estimate of the average number of concurrent connections during transfer.
     pub fn update(&mut self, size_bytes: u64, duration: Duration, avg_concurrent: f64) {
         let now = Instant::now();
         let elapsed = now.duration_since(self.last_update).as_secs_f64();
@@ -188,9 +181,7 @@ impl LatencyPredictor {
         let query_bytes = 10 * 1024 * 1024;
 
         // How long would it take to transmit this at full bandwidth
-        let Some(min_latency) = self.predicted_latency(query_bytes, 1.) else {
-            return None;
-        };
+        let min_latency = self.predicted_latency(query_bytes, 1.)?;
 
         // Report bytes per sec in this model.
         Some(query_bytes as f64 / min_latency.max(1e-6))
