@@ -45,7 +45,7 @@ utils::configurable_constants! {
     ref MAX_CONCURRENT_UPLOADS: usize = 100;
 
     /// The minimum number of simultaneous xorb and/or shard upload streams that the
-    /// the adaptive concurrency control may reduce the concurrancy down to on slower connections.
+    /// the adaptive concurrency control may reduce the concurrency down to on slower connections.
     ref MIN_CONCURRENT_UPLOADS: usize = 2;
 
     /// The starting number of concurrent upload streams, which will increase up to MAX_CONCURRENT_UPLOADS

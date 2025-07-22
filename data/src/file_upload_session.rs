@@ -184,7 +184,7 @@ impl FileUploadSession {
             let file_id = self.completion_tracker.register_new_file(file_name.clone(), file_size).await;
 
             // Now, spawn a task
-            let ingestion_concurrancy_limiter = file_parallel_limiter.clone();
+            let ingestion_concurrency_limiter = file_parallel_limiter.clone();
             let session = self.clone();
 
             cleaning_tasks.push(tokio::spawn(async move {
@@ -201,7 +201,7 @@ impl FileUploadSession {
                     "file.defrag_prevented_dedup_chunks" = tracing::field::Empty,
                 );
                 // First, get a permit to process this file.
-                let _processing_permit = ingestion_concurrancy_limiter.acquire().await?;
+                let _processing_permit = ingestion_concurrency_limiter.acquire().await?;
 
                 async move {
                     let mut reader = File::open(&file_path)?;

@@ -228,6 +228,7 @@ impl RetryWrapper {
                         Ok(resp) => self_.process_ok_response(try_idx, resp),
                     };
 
+                    // reply_bytes is ignored if the size was specified earlier, as in the case for upload.
                     let (reply_bytes, processing_result) = match checked_result {
                         Ok(ok_response) => (ok_response.content_length().unwrap_or(0), process_fn(ok_response).await),
                         Err(e) => (0, Err(e)),

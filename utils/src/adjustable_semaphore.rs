@@ -5,9 +5,11 @@ use std::sync::Arc;
 use tokio::sync::{AcquireError, Semaphore};
 
 /// An adjustable semaphore in which the total number of permits can be adjusted at any time
-/// between a minimum and a maximum bound.  Adjustments do not affect any permits currently
-/// issued; if an adjustment cannot be permformed immediately, then it is resolved before any
-/// new permits are issued.
+/// between a minimum and a maximum bound.  
+///
+/// Unlike the tokio Semaphore, decreasing the number of permits may be done at any time and
+/// are resolved lazily if needed; any permits currently issued remain valid, but no new permits
+/// are issued until any requested decreases are resolved.
 pub struct AdjustableSemaphore {
     semaphore: Arc<Semaphore>,
     total_permits: AtomicUsize,
@@ -17,7 +19,7 @@ pub struct AdjustableSemaphore {
 }
 
 /// A permit issued by the AdjustableSemaphore.  On drop, this attempts to
-/// resolve an enqueued permit decrease if one is needed.
+/// resolve any enqueued permit decrease if one is needed.
 pub struct AdjustableSemaphorePermit {
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
     parent: Arc<AdjustableSemaphore>,
@@ -65,6 +67,11 @@ impl AdjustableSemaphore {
         // A few debug mode consistency checks.
         debug_assert!(self.semaphore.available_permits() <= self.max_permits);
 
+        // To ensure that the fairness property of the enclosed tokio semaphore is respected,
+        // this function must only call this class and not attempt to resolve anything else.
+        //
+        // As a result, any decreases are resolved by the Drop trait of this permit, which may
+        // mean that permit is forgotten to resolve an outstanding decrease.
         let permit = self.semaphore.clone().acquire_owned().await?;
 
         Ok(AdjustableSemaphorePermit {

@@ -44,7 +44,7 @@ impl ConcurrencyControllerState {
     }
 }
 
-/// A controller for dynamically adjusting the amount of concurrancy on upload and download paths.
+/// A controller for dynamically adjusting the amount of concurrency on upload and download paths.
 ///
 /// This controller uses two statistical models that adapt over time using exponentially weighted
 /// moving averages.  The first is a model that predicts the overall current bandwith, and the second is
@@ -99,7 +99,7 @@ impl AdaptiveConcurrencyController {
         })
     }
 
-    /// Acquire a connection permit based on the current concurrancy.
+    /// Acquire a connection permit based on the current concurrency.
     pub async fn acquire_connection_permit(self: &Arc<Self>) -> Result<ConnectionPermit, CasClientError> {
         let permit = self.concurrency_semaphore.acquire().await?;
 
