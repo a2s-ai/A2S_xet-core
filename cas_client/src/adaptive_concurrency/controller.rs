@@ -47,10 +47,12 @@ impl ConcurrencyControllerState {
 /// A controller for dynamically adjusting the amount of concurrency on upload and download paths.
 ///
 /// This controller uses two statistical models that adapt over time using exponentially weighted
-/// moving averages.  The first is a model that predicts the overall current bandwith, and the second is
-/// a model of how many transfers complete within the predicted time.
+/// moving averages.  The first is a model that predicts the overall current bandwith, and the second  and the second is
+/// a model of the deviance between the actual transfer time and the predicted time based on a linear scaling of the
+/// concurrency.
 ///
 /// The key insight is this:
+///
 /// 1. When a network connection is underutilized, the latency scales sublinearly with the number of parallel
 ///    connections. In other words, adding another transfer does not affect the speed of the other transfers
 ///    significantly.
